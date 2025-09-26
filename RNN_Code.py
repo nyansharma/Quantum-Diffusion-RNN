@@ -1,56 +1,64 @@
-#Quantum Diffusion Model RNN Code
-import cupy as np
-import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import os
-from torch.autograd import Variable
 import random
+import cupy as np 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-#Setting up the seed
-def seed_setup(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-seed_setup(0)
-#Pauli Basis for 1 Qubit
-X = torch.tensor([[0,1],[1,0]], dtype = torch.cfloat, device = device)
-Y = torch.tensor([[0, -1j], [1j, 0]], dtype = torch.cfloat, device = device)
-Z = torch.tensor([[1,0],[0,1]], dtype = torch.cfloat, device = device)
-I2 = torch.eye(2, dtype = torch.cfloat, device=device)
-PAULI = [X,Y, Z]
-#Initial State Definition, |0>
-psi_0 = torch.tensor([1,0], dtype = torch.cfloat, device = device)
-#Kraus Operator Definiton
-def K_dt(gamma, dt, dot, ot):
-    coeff = (2*gamma)/(np.pi * dt)
-    exp =-1*(gamma/dt)*(dot-ot*dt)**2
-    return torch.tensor((coeff**0.25)*np.exp(exp), dtype = torch.cfloat, device=device)
 
-def stochastic_evolve(K_dt, psi_0):
-    num = K_dt @ psi_0
-    denom = np.linalg.norm(K_dt @ psi_0)
+# Pauli basis
+X = torch.tensor([[0,1],[1,0]], dtype=torch.cfloat, device=device)
+Y = torch.tensor([[0,-1j],[1j,0]], dtype=torch.cfloat, device=device)
+Z = torch.tensor([[1,0],[0,-1]], dtype=torch.cfloat, device=device)  
+I2 = torch.eye(2, dtype=torch.cfloat, device=device)
+PAULI = [X, Y, Z]
+
+# Initial state |0>
+psi_0 = torch.tensor([1,0], dtype=torch.cfloat, device=device)
+
+# Kraus operator
+def K_dt(gamma, dt, dot, O_t):
+    prefactor = (2 * gamma / (torch.pi * dt))**0.25
+    I = torch.eye(O_t.shape[0], device=device, dtype=O_t.dtype)
+    diff = dot * I - O_t * dt
+    A = -(gamma / dt) * (diff @ diff)
+    return prefactor * torch.linalg.matrix_exp(A)
+
+def stochastic_evolve(K, psi):
+    num = K @ psi
+    denom = torch.linalg.norm(num)
     return num / denom
 
+# Hamiltonian
 def Hamiltonian(h):
-    return h[0]*X+h[1]*Y+h[2]*Z
+    return h[0]*X + h[1]*Y + h[2]*Z
 
-#Fidelity based loss function 
-def loss(V, psi_t, psi_t_dt,):
-    prod = psi_t_dt @ V @ psi_t
-    return 1 - np.mean(np.linalg.norm(prod)**2)
+def finding_ground_state(H):
+    eigvals = torch.linalg.eigvals(H).real
+    return torch.min(eigvals)
 
-def pauli_exp(psi_t):
-    #Equivalent to <psi | P | psi>
-    return psi_t @ I2 @ X @ Y @ Z @ psi_t
+def loss(psi, H):
+    energy = torch.conj(psi) @ (H @ psi)
+    energy = energy.real
+    return energy - finding_ground_state(H)
+
+def pauli_exp(psi, O):
+    return torch.conj(psi) @ (O @ psi)
 def find_dot(psi, O, gamma, dt):
-    prod = (psi @ O @ psi) * dt
-    dW = np.random.normal(loc=0.0, scale=np.sqrt(dt))
-    return torch.tensor(prod + (dW)/(2*np.sqrt(gamma)), dtype = torch.cfloat, device=device)
+    exp_val = pauli_exp(psi, O).real
+    dW = torch.sqrt(torch.tensor(dt, device=device)) * torch.randn(1, device=device)
+    return exp_val * dt + dW / (2*torch.sqrt(torch.tensor(gamma, device=device)))
+
+# Simulate trajectory
+def simulate_kraus_traj(psi0, steps=20, dt=0.01, gamma=1.0):
+    psi = psi0.clone()
+    traj = [psi.clone()]
+    for t in range(steps):
+        O = PAULI[random.randint(0,2)]
+        dot = find_dot(psi, O, gamma, dt)
+        K = K_dt(gamma, dt, dot, O)
+        psi = stochastic_evolve(K, psi)
+        traj.append(psi.clone())
+    return traj
 input_dim = 2
 embedding_dim = 128
 hidden_dim = 128
@@ -58,7 +66,8 @@ output_size= 2
 def simulate_kraus_traj(psi0, steps = 20, dt = 0.01, gamma=1):
     psi = psi0.clone()
     traj = [psi.clone()]
-    zs = [pauli_exp(psi)]
+    O = PAULI[np.random.randint(0,3).item()]
+    zs = [pauli_exp(psi,O)]
     dos = []
     Ks =[]
     for t in range(steps):
@@ -66,8 +75,8 @@ def simulate_kraus_traj(psi0, steps = 20, dt = 0.01, gamma=1):
         dot = find_dot(psi, O, gamma, dt)
         K = K_dt(gamma, dt, dot, O)
         psi = stochastic_evolve(K, psi)
-        traj.append(psi.close())
-        zs.append(pauli_exp(psi).cpu())
+        traj.append(psi.clone())
+        zs.append(pauli_exp(psi,O))
         dos.append(dot)
         Ks.append(K)
     return traj
@@ -75,9 +84,9 @@ def simulate_kraus_traj(psi0, steps = 20, dt = 0.01, gamma=1):
 class Diffusion_RNN(nn.Module):
     def __init__(self, input_dim, embedding_dim, hidden_dim, output_size):
         super(Diffusion_RNN, self).__init__()
-        self.embedding = nn.Embedding(input_dim, embedding_dim)
-        self.rnn = nn.RNN(embedding_dim, hidden_dim, batch_first = True)
-        self.fc = nn.LSTM(hidden_dim, output_size)
+        self.embedding = nn.Embedding(input_dim, embedding_dim, device=device)
+        self.rnn = nn.RNN(embedding_dim, hidden_dim, batch_first = True, device = device)
+        self.fc = nn.LSTM(hidden_dim, output_size, device=device)
     
     def forward(self, x):
         x = self.embedding(x)
@@ -96,8 +105,8 @@ for epoch in range(num_epochs):
     initial_conditions = simulate_kraus_traj(psi_0)
     h = [np.random.randint(0,1),np.random.randint(0,1), np.random.randint(0,1)]
     for j, psi in enumerate(initial_conditions):
-        output = model(psi)
-        loss = loss(Hamiltonian(h), initial_conditions[j-1], psi)
+        output = model(torch.tensor(j, dtype=torch.long, device = device))
+        loss = loss(Hamiltonian(h), psi)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
