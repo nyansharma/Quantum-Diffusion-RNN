@@ -24,12 +24,21 @@ psi_0 = torch.tensor(
     dtype=torch.complex64,  # use .complex64 for CUDA compatibility
     device=device
 )
-
+def ln(x, N):
+    sum = 0
+    for i in range(1,N):
+        term = ((-1)**(N-1)/N)*(x-I2)**N
+        sum += term
+    return sum
+def Hamiltonian(h):
+    return h[0]*X+h[1]*Y+h[2]*Z
 #Score function
 def unitary_score(H, dt):
     return (1j * H * dt).matrix_exp()
 #Loss function (particularly for reverse)
-def mean_fidelity_loss(psi, V, psi_dt):
+def mean_fidelity_loss(psi, psi_dt, model, dt):
+    H = Hamiltonian(model.h)
+    V = unitary_score(H, dt)
     return 1 - torch.abs(torch.vdot(psi, V @ psi_dt))**2
 
 def pauli_exp(psi, O):
@@ -40,9 +49,14 @@ def forward_diffusion(gamma, dt, T):
     n = int(T / dt)
     psi = [None] * n
     psi[0] = psi_0.clone()
-    O = [PAULI[np.random.randint(0, 4).item()] for _ in range(n)]
+    if(device == "cuda:0"):
+        O = [PAULI[np.random.randint(0, 4).item()] for _ in range(n)]
+    else:
+        O = [PAULI[np.random.randint(0, 4)] for _ in range(n)]
     gamma = float(gamma)
-
+    H = [None]*n
+    h = torch.randn(3)
+    H[0] = h[0]*X+h[1]*Y+h[2]*Z
     for i in range(n - 1):
         psi_i = psi[i]
         Oi = O[i].to(torch.complex64).to(device)
@@ -55,10 +69,11 @@ def forward_diffusion(gamma, dt, T):
             - (gamma / 2) * delta_O @ delta_O * dt
             + torch.sqrt(torch.tensor(gamma, device=device)) * delta_O * dW
         )
+        H[i+1] = 1j*ln(update, 100)/dt
         psi[i+1] = update @ psi_i
         psi[i+1] = psi[i+1] / torch.linalg.norm(psi[i+1])
         psi[i+1] = psi[i+1].clone().detach().requires_grad_(True)
-    return psi
+    return psi, H
 
 input_dim = 2
 hidden_dim = 64
@@ -72,7 +87,7 @@ class Diffusion_RNN(nn.Module):
     def forward(self, psi_t, dt):
         out, _ = self.rnn(psi_t)
         out = self.fc(out[:, -1, :])
-        H = self.h[0]*X+self.h[1]*Y+self.h[2]*Z
+        H = Hamiltonian(self.h)
         V = (1j*H*dt).matrix_exp()
         psi_t_complex = psi_t[:, -1, :].to(torch.complex64)
         correction = out.to(torch.complex64)
@@ -89,7 +104,7 @@ for epoch in range(num_epochs):
     total_loss = 0
 
     # simulate forward diffusion
-    sim = forward_diffusion(gamma = 0.5, dt = 0.01, T =1)
+    sim = forward_diffusion(gamma = 0.05, dt = 0.05, T =1)
     for j in range(len(sim)-1):
         # convert psi to tensor with batch and seq dimensions
         psi_t = sim[j]
@@ -97,14 +112,14 @@ for epoch in range(num_epochs):
         psi_tensor = torch.tensor(psi_t, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
 
         # forward pass
-        output, V, H = model(psi_tensor, 0.01)
-        L = mean_fidelity_loss(psi_t, V, psi_dt)
+        output, V, H = model(psi_tensor, 0.05)
+        loss = mean_fidelity_loss(psi_t, psi_dt, model, dt=0.05)
 
         optimizer.zero_grad()
-        L.backward()
+        loss.backward()
         optimizer.step()
         H_history.append(model.h.detach().clone())
-        total_loss += L.item()
+        total_loss += loss.item()
 
     print(f"Epoch {epoch+1}, Loss: {total_loss / len(sim):.4f}, h = {model.h}")
 H_history = torch.stack(H_history)
