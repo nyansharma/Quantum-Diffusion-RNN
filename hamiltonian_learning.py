@@ -1,14 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import random
-import matplotlib.pyplot as plt
-if(torch.cuda.is_available()):
-    device = torch.device("cuda:0")
-    import cupy as np
-else:
-    device = torch.device("cpu")
-    import numpy as np
+import numpy as np
+device = torch.device("cpu")
 
 # Pauli basis
 X = torch.tensor([[0,1],[1,0]], dtype=torch.cfloat, device=device)
@@ -18,18 +12,13 @@ I2 = torch.eye(2, dtype=torch.cfloat, device=device)
 PAULI = [I2, X, Y, Z]
 
 # Initial state 
+np.random.seed(67)
 x = np.random.randn(2) + 1j * np.random.randn(2)  # random complex vector
 psi_0 = torch.tensor(
     x / np.linalg.norm(x), 
     dtype=torch.complex64,  # use .complex64 for CUDA compatibility
     device=device
 )
-def ln(x, N):
-    sum = 0
-    for i in range(1,N):
-        term = ((-1)**(N-1)/N)*(x-I2)**N
-        sum += term
-    return sum
 def Hamiltonian(h):
     return h[0]*X+h[1]*Y+h[2]*Z
 #Score function
@@ -49,14 +38,8 @@ def forward_diffusion(gamma, dt, T):
     n = int(T / dt)
     psi = [None] * n
     psi[0] = psi_0.clone()
-    if(device == "cuda:0"):
-        O = [PAULI[np.random.randint(0, 4).item()] for _ in range(n)]
-    else:
-        O = [PAULI[np.random.randint(0, 4)] for _ in range(n)]
+    O = [PAULI[np.random.randint(0, 4)] for _ in range(n)]
     gamma = float(gamma)
-    H = [None]*n
-    h = torch.randn(3)
-    H[0] = h[0]*X+h[1]*Y+h[2]*Z
     for i in range(n - 1):
         psi_i = psi[i]
         Oi = O[i].to(torch.complex64).to(device)
@@ -69,11 +52,10 @@ def forward_diffusion(gamma, dt, T):
             - (gamma / 2) * delta_O @ delta_O * dt
             + torch.sqrt(torch.tensor(gamma, device=device)) * delta_O * dW
         )
-        H[i+1] = 1j*ln(update, 100)/dt
         psi[i+1] = update @ psi_i
         psi[i+1] = psi[i+1] / torch.linalg.norm(psi[i+1])
         psi[i+1] = psi[i+1].clone().detach().requires_grad_(True)
-    return psi, H
+    return psi
 
 input_dim = 2
 hidden_dim = 64
@@ -91,13 +73,15 @@ class Diffusion_RNN(nn.Module):
         V = (1j*H*dt).matrix_exp()
         psi_t_complex = psi_t[:, -1, :].to(torch.complex64)
         correction = out.to(torch.complex64)
-        pred_next = (V @ psi_t_complex.T).T + correction  # (batch, 2)
+        pred_next = (V @ psi_t_complex.T).T + correction 
         pred_next = pred_next / torch.linalg.norm(pred_next, dim=1, keepdim=True)
         return pred_next, V, H
 model = Diffusion_RNN(input_dim, hidden_dim, output_size).to(device)
+torch.save(model.state_dict(), "trained_diffusion_rnn.pth")
 num_epochs = 1000
 criterion = nn.CrossEntropyLoss()
 H_history = []
+psi_history = []
 optimizer = optim.Adam(model.parameters(), lr = 0.001)
 for epoch in range(num_epochs):
     model.train()
@@ -119,19 +103,8 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
         H_history.append(model.h.detach().clone())
+        psi_history.append(psi_t.detach().clone())
         total_loss += loss.item()
-
-    print(f"Epoch {epoch+1}, Loss: {total_loss / len(sim):.4f}, h = {model.h}")
+    psi_history.append(sim[-1])
 H_history = torch.stack(H_history)
 H_np = H_history.detach().cpu().numpy()
-print(H_np[len(H_np)-1])
-plt.figure(figsize=(8,5))
-plt.plot(H_np[:,0], label='h_x')
-plt.plot(H_np[:,1], label='h_y')
-plt.plot(H_np[:,2], label='h_z')
-plt.xlabel('Epoch')
-plt.ylabel('Coefficient value')
-plt.title('Learned Hamiltonian coefficients (GPU-trained)')
-plt.legend()
-plt.savefig("Hamiltonian_Chart.png")
-plt.show()
