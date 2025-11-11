@@ -77,7 +77,7 @@ class Diffusion_RNN(nn.Module):
         pred_next = pred_next / torch.linalg.norm(pred_next, dim=1, keepdim=True)
         return pred_next, V, H
 model = Diffusion_RNN(input_dim, hidden_dim, output_size).to(device)
-torch.save(model.state_dict(), "trained_diffusion_rnn.pth")
+torch.save(model.state_dict(), "trained_diffusion_pure_rnn.pth")
 num_epochs = 1000
 criterion = nn.CrossEntropyLoss()
 H_history = []

@@ -1,5 +1,5 @@
 import torch
-import hamiltonian_learning
+import hamiltonian_learning_pure as hamiltonian_learning
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
@@ -32,14 +32,14 @@ ham_model = hamiltonian_learning.Diffusion_RNN(2,64, 2).to(device)
 ham_model.load_state_dict(torch.load("trained_diffusion_rnn.pth"))
 ham_model.eval()
 def complex_to_real(x):
-    real = torch.view_as_real(x)                  # (B, T, D, 2)
+    real = torch.view_as_real(x)                  
     real = real.reshape(real.shape[0], real.shape[1], real.shape[2]*2)
     return real
 
 def real_to_complex(x):
     D = x.shape[0] // 2
-    x = x.reshape(D, 2)                   # (D, 2)
-    return torch.view_as_complex(x)       # (D,)
+    x = x.reshape(D, 2)                   
+    return torch.view_as_complex(x)      
 #Score function
 def unitary_score(H, dt):
     return (-1j * H * dt).matrix_exp()
