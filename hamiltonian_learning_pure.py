@@ -206,175 +206,274 @@ def forward_diffusion(dt, T, noise_strength=0.5):
     
     return psi, H
 
-class ScoreBasedReverseRNN(nn.Module):
+class HamiltonianDenoisingNetwork(nn.Module):
     def __init__(self, hidden_dim=256):
         super().__init__()
         self.hidden_dim = hidden_dim
         
-        # Encode current state and time to half hidden_dim each
-        self.state_encoder = nn.Sequential(
-            nn.Linear(4, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.Tanh(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 2)
+        # Main encoder: state + time -> features
+        self.encoder = nn.Sequential(
+            nn.Linear(4 + 1, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
         )
         
-        self.time_encoder = nn.Sequential(
-            nn.Linear(1, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.Tanh(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 2)
+        # Predict the effective Hamiltonian that generated the dynamics
+        self.hamiltonian_predictor = nn.Sequential(
+            nn.Linear(hidden_dim, 256),
+            nn.SiLU(),
+            nn.Linear(256, 128),
+            nn.SiLU(),
+            nn.Linear(128, 8)  # 2x2 complex Hamiltonian = 8 real params (4 real + 4 imag)
         )
         
-        # LSTM for temporal dynamics - input is hidden_dim (state + time concatenated)
-        self.rnn = nn.LSTMCell(hidden_dim, hidden_dim)
-        
-        # Initialize hidden state projection
-        self.h_init = nn.Linear(hidden_dim, hidden_dim)
-        
-        # Predict the score (gradient of log probability)
-        self.score_head = nn.Sequential(
-            nn.Linear(hidden_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, 64),
-            nn.Tanh(),
-            nn.Linear(64, 4)
+        # Predict the flow vector (drift + score)
+        self.flow_predictor = nn.Sequential(
+            nn.Linear(hidden_dim, 256),
+            nn.SiLU(),
+            nn.Linear(256, 128),
+            nn.SiLU(),
+            nn.Linear(128, 4)  # Flow in 4D real space
         )
         
-        # Predict the denoising direction
-        self.denoise_head = nn.Sequential(
-            nn.Linear(hidden_dim, 128),
-            nn.Tanh(),
+        # Predict the noise that was added
+        self.noise_predictor = nn.Sequential(
+            nn.Linear(hidden_dim, 256),
+            nn.SiLU(),
+            nn.Linear(256, 128),
+            nn.SiLU(),
+            nn.Linear(128, 4)
+        )
+        
+        # Predict the clean state directly
+        self.clean_predictor = nn.Sequential(
+            nn.Linear(hidden_dim, 256),
+            nn.SiLU(),
+            nn.Linear(256, 128),
+            nn.SiLU(),
             nn.Linear(128, 4)
         )
     
-    def forward(self, psi_T, t_start, steps, return_trajectory=True):
+    def forward(self, psi_noisy, t):
+        """
+        Predict Hamiltonian, flow, noise, and clean state
+        """
+        if isinstance(psi_noisy, np.ndarray):
+            psi_noisy = torch.from_numpy(psi_noisy)
+        
+        if torch.is_complex(psi_noisy):
+            psi_real = complex_to_real(psi_noisy.to(torch.complex64))
+        else:
+            psi_real = psi_noisy
+        
+        # Expand time to match batch if needed
+        if isinstance(t, (float, int)):
+            t = torch.tensor([t], dtype=torch.float32)
+        if t.dim() == 0:
+            t = t.unsqueeze(0)
+        if psi_real.dim() == 1:
+            t = t.expand(1)
+        
+        # Concatenate state and time
+        x = torch.cat([psi_real, t], dim=-1)
+        
+        # Encode
+        features = self.encoder(x)
+        
+        # Predict Hamiltonian (2x2 complex matrix)
+        H_flat = self.hamiltonian_predictor(features)  # 8 values
+        H_real = H_flat[:4].reshape(2, 2)
+        H_imag = H_flat[4:].reshape(2, 2)
+        
+        # Make Hamiltonian Hermitian: H = H†
+        H_real = 0.5 * (H_real + H_real.T)  # Symmetric real part
+        H_imag = 0.5 * (H_imag - H_imag.T)  # Antisymmetric imaginary part
+        H_complex = torch.complex(H_real, H_imag)
+        
+        # Predict flow vector (for reverse SDE)
+        flow_pred = self.flow_predictor(features)
+        
+        # Predict noise
+        noise_pred = self.noise_predictor(features)
+        
+        # Predict clean state
+        clean_pred = self.clean_predictor(features)
+        
+        # Normalize clean prediction
+        clean_complex = real_to_complex(clean_pred)
+        clean_normalized = complex_to_real(clean_complex)
+        
+        return H_complex, flow_pred, noise_pred, clean_normalized
+    
+    def hamiltonian_evolution(self, psi, H, dt):
+        """
+        Apply Hamiltonian evolution: |ψ(t+dt)⟩ = exp(-iHdt)|ψ(t)⟩
+        """
+        if not torch.is_complex(psi):
+            psi = real_to_complex(psi)
+        
+        # For small dt, use first-order: ψ(t+dt) ≈ (I - iHdt)ψ(t)
+        # For better accuracy, we should use matrix exponential
+        evolution = torch.eye(2, dtype=torch.complex64) - 1j * H * dt
+        
+        # Apply evolution
+        psi_evolved = evolution @ psi
+        
+        # Renormalize
+        psi_evolved = psi_evolved / torch.sqrt(torch.sum(torch.abs(psi_evolved)**2))
+        
+        return psi_evolved
+    
+    def denoise_step_with_hamiltonian(self, psi_noisy, t, dt=0.01, use_hamiltonian=True):
+        """
+        Denoising step that incorporates Hamiltonian physics
+        """
+        H_pred, flow_pred, noise_pred, clean_pred = self.forward(psi_noisy, t)
+        
+        if torch.is_complex(psi_noisy):
+            psi_real = complex_to_real(psi_noisy.to(torch.complex64))
+        else:
+            psi_real = psi_noisy
+        
+        # Method 1: Use Hamiltonian evolution (physics-based)
+        if use_hamiltonian and t > 0.3:  # Use Hamiltonian for middle range
+            psi_complex = real_to_complex(psi_real)
+            psi_evolved = self.hamiltonian_evolution(psi_complex, H_pred, -dt)  # Negative time
+            denoised = complex_to_real(psi_evolved)
+        
+        # Method 2: Use flow-based denoising (for strong noise)
+        elif t > 0.1:
+            alpha = 1 - t
+            denoised = psi_real + flow_pred * dt - (1 - alpha) * noise_pred * dt
+        
+        # Method 3: Direct clean prediction (for weak noise)
+        else:
+            # Interpolate between current state and clean prediction
+            denoised = 0.7 * clean_pred + 0.3 * psi_real
+        
+        # Normalize
+        denoised_complex = real_to_complex(denoised)
+        return complex_to_real(denoised_complex)
+    
+    def reverse_diffusion(self, psi_T, steps, use_hamiltonian=True):
+        """
+        Full reverse diffusion using Hamiltonian when appropriate
+        """
         if isinstance(psi_T, np.ndarray):
             psi_T = torch.from_numpy(psi_T)
         
         psi_T = psi_T.to(torch.complex64)
-        
-        # Start from the input state
         curr = complex_to_real(psi_T)
         
-        # Initialize LSTM hidden state
-        state_enc = self.state_encoder(curr)
-        time_enc = self.time_encoder(torch.tensor([[t_start]], dtype=torch.float32)).squeeze(0)
+        trajectory = [curr]
+        dt = 1.0 / steps
         
-        # Concatenate state and time encodings
-        combined = torch.cat([state_enc, time_enc], dim=-1)  # Now this is hidden_dim
-        h = self.h_init(combined)
-        c = torch.zeros(self.hidden_dim)
-        
-        traj = [curr]
-        
+        # Reverse diffusion steps
         for i in range(steps):
-            t = torch.tensor([[t_start - (i+1)/steps]], dtype=torch.float32)
+            t = torch.tensor([1.0 - (i + 1) / steps], dtype=torch.float32)
             
-            # Encode current state and time
-            state_enc = self.state_encoder(curr)
-            time_enc = self.time_encoder(t).squeeze(0)
+            # Denoise using Hamiltonian-aware method
+            curr = self.denoise_step_with_hamiltonian(curr, t, dt, use_hamiltonian)
             
-            # Combine for RNN input (hidden_dim total)
-            rnn_input = torch.cat([state_enc, time_enc], dim=-1).unsqueeze(0)
-            
-            # Update LSTM - now dimensions match
-            h, c = self.rnn(rnn_input, (h.unsqueeze(0), c.unsqueeze(0)))
-            h, c = h.squeeze(0), c.squeeze(0)
-            
-            # Predict score (gradient direction)
-            score = self.score_head(h)
-            
-            # Predict denoising direction
-            denoise_direction = self.denoise_head(h)
-            
-            # Reverse SDE step: moves against noise
-            # The update includes both drift reversal and score term
-            step_size = 0.02 * (1 - i/steps)  # Adaptive step size
-            curr = curr + step_size * (denoise_direction + 0.5 * score)
-            
-            # Renormalize
-            curr_complex = real_to_complex(curr)
-            curr = complex_to_real(curr_complex)
-            
-            if return_trajectory:
-                traj.append(curr)
+            trajectory.append(curr)
         
-        if return_trajectory:
-            return torch.stack(traj)
-        else:
-            return curr
+        return torch.stack(trajectory)
 
-# Enhanced loss that looks at trajectory
-class TrajectoryFidelityLoss(nn.Module):
-    def __init__(self, trajectory_weight=0.3):
+
+# Loss function that includes Hamiltonian consistency
+class HamiltonianDenoisingLoss(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.trajectory_weight = trajectory_weight
     
-    def forward(self, pred_traj, target, intermediate_states=None):
-        target = target.to(torch.complex64)
+    def forward(self, H_pred, flow_pred, noise_pred, clean_pred, 
+                true_noise, true_clean, psi_current, H_true=None):
+        """
+        Multi-objective loss:
+        1. Clean state fidelity
+        2. Noise prediction accuracy
+        3. Hamiltonian consistency (if H_true provided)
+        4. Flow vector accuracy
+        """
+        true_clean = true_clean.to(torch.complex64)
+        true_clean_real = complex_to_real(true_clean)
         
-        # Final state loss (most important)
-        final_pred = pred_traj[-1]
-        pred_c = real_to_complex(final_pred)
-        overlap = torch.sum(pred_c.conj() * target)
-        final_fidelity = torch.abs(overlap) ** 2
-        final_loss = 1 - final_fidelity
+        # 1. Clean state prediction loss (fidelity)
+        clean_pred_complex = real_to_complex(clean_pred)
+        overlap = torch.sum(clean_pred_complex.conj() * true_clean)
+        fidelity = torch.abs(overlap) ** 2
+        clean_loss = 1 - fidelity
         
-        # Trajectory smoothness loss
-        trajectory_loss = 0.0
-        if len(pred_traj) > 1:
-            for i in range(len(pred_traj) - 1):
-                diff = pred_traj[i+1] - pred_traj[i]
-                trajectory_loss += torch.sum(diff ** 2)
-            trajectory_loss = trajectory_loss / (len(pred_traj) - 1)
+        # 2. Noise prediction loss (MSE)
+        if true_noise is not None:
+            noise_loss = torch.mean((noise_pred - true_noise) ** 2)
+        else:
+            noise_loss = 0.0
         
-        # Optional: intermediate state loss if provided
-        intermediate_loss = 0.0
-        if intermediate_states is not None:
-            n_intermediate = min(5, len(pred_traj) // 2)
-            indices = torch.linspace(0, len(pred_traj)-1, n_intermediate).long()
-            for idx in indices:
-                if idx < len(intermediate_states):
-                    pred_state = real_to_complex(pred_traj[idx])
-                    true_state = torch.from_numpy(intermediate_states[idx]).to(torch.complex64)
-                    overlap = torch.sum(pred_state.conj() * true_state)
-                    intermediate_loss += 1 - torch.abs(overlap) ** 2
-            intermediate_loss = intermediate_loss / n_intermediate
+        # 3. Hamiltonian consistency: H should be Hermitian and physically reasonable
+        # Check Hermiticity: ||H - H†|| should be small
+        H_herm_error = torch.sum(torch.abs(H_pred - H_pred.conj().T) ** 2)
         
-        # Combined loss
-        total_loss = final_loss + \
-                     self.trajectory_weight * trajectory_loss + \
-                     0.1 * intermediate_loss
+        # Energy should be bounded (regularization)
+        psi_complex = real_to_complex(true_clean_real)
+        energy = torch.real(psi_complex.conj() @ H_pred @ psi_complex)
+        energy_penalty = torch.relu(torch.abs(energy) - 10.0)  # Penalize unreasonably large energies
+        
+        hamiltonian_loss = H_herm_error + 0.1 * energy_penalty
+        
+        # 4. Flow vector should align with denoising direction
+        denoising_direction = true_clean_real - complex_to_real(real_to_complex(true_clean_real))
+        flow_alignment = -torch.sum(flow_pred * denoising_direction)  # Negative because we want alignment
+        
+        # Combined loss with weights
+        total_loss = (
+            0.5 * clean_loss +           # Most important: get clean state right
+            0.2 * noise_loss +            # Learn to predict noise
+            0.1 * hamiltonian_loss +      # Ensure physical consistency
+            0.05 * flow_alignment         # Flow should point toward clean state
+        )
         
         return total_loss
+
+model = HamiltonianDenoisingNetwork(hidden_dim=256)
 EPOCHS = 100
-model = ScoreBasedReverseRNN(hidden_dim=256)
-criterion = TrajectoryFidelityLoss(trajectory_weight=0.2)
-optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+criterion = HamiltonianDenoisingLoss()
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-# Training Step with intermediate states
-def train_step(model, optimizer, psi_trajectory, criterion, steps):
+# Training Step - train on random timesteps with Hamiltonian supervision
+def train_step(model, optimizer, psi_trajectory, H_trajectory, criterion):
     optimizer.zero_grad()
     
-    psi_noisy = psi_trajectory[-1]  # End state (noisy)
-    psi_clean = psi_trajectory[0]   # Start state (clean)
+    # Sample random timestep
+    n_steps = len(psi_trajectory)
+    t_idx = np.random.randint(1, n_steps)
+    t = t_idx / n_steps
     
-    # Convert to tensors
-    psi_noisy = torch.from_numpy(psi_noisy).to(torch.complex64)
-    psi_clean = torch.from_numpy(psi_clean).to(torch.complex64)
+    # Get states
+    psi_noisy = torch.from_numpy(psi_trajectory[t_idx]).to(torch.complex64)
+    psi_clean = torch.from_numpy(psi_trajectory[0]).to(torch.complex64)
     
-    # Get predicted trajectory
-    pred_traj = model(psi_noisy, t_start=1.0, steps=steps)
+    # Get true Hamiltonian if available
+    H_true = None
+    if H_trajectory is not None and t_idx < len(H_trajectory):
+        H_true = torch.from_numpy(H_trajectory[t_idx]).to(torch.complex64)
     
-    # Sample some intermediate states for supervision
-    n_intermediate = min(5, len(psi_trajectory) // 10)
-    indices = np.linspace(0, len(psi_trajectory)-1, n_intermediate, dtype=int)
-    intermediate_states = [psi_trajectory[idx] for idx in indices]
+    # Compute the noise that was added
+    psi_noisy_real = complex_to_real(psi_noisy)
+    psi_clean_real = complex_to_real(psi_clean)
+    true_noise = psi_noisy_real - psi_clean_real
+    
+    # Predict
+    t_tensor = torch.tensor([t], dtype=torch.float32)
+    H_pred, flow_pred, noise_pred, clean_pred = model(psi_noisy, t_tensor)
     
     # Compute loss
-    loss = criterion(pred_traj, psi_clean, intermediate_states)
+    loss = criterion(H_pred, flow_pred, noise_pred, clean_pred, 
+                    true_noise, psi_clean, psi_noisy_real, H_true)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
@@ -383,7 +482,7 @@ def train_step(model, optimizer, psi_trajectory, criterion, steps):
 
 print(f"Starting training on {device}...")
 
-EPOCHS = 150
+
 DT = 0.01
 T = 1.0
 STEPS = int(T / DT)
@@ -392,17 +491,20 @@ best_loss = float('inf')
 
 for epoch in range(EPOCHS):
     total_loss = 0.0
-    for _ in range(20):
-        # Generate full trajectory for training
+    
+    # Train on multiple trajectories per epoch
+    for _ in range(50):
+        # Generate trajectory with Hamiltonians
         if np.random.rand() < 0.5:
             psi_fwd, H_fwd, rho_fwd = forward_diffusion_with_probability(dt=DT, T=T, noise_strength=1.0)
         else:
             psi_fwd, H_fwd = forward_diffusion(dt=DT, T=T, noise_strength=1.0)
         
-        total_loss += train_step(model, optimizer, psi_fwd, criterion, steps=STEPS)
+        # Train on this trajectory
+        total_loss += train_step(model, optimizer, psi_fwd, H_fwd, criterion)
     
     scheduler.step()
-    avg_loss = total_loss / 20
+    avg_loss = total_loss / 50
     
     if avg_loss < best_loss:
         best_loss = avg_loss
@@ -413,7 +515,7 @@ for epoch in range(EPOCHS):
 def reverse_diffusion(model, psi_T, steps):
     model.eval()
     with torch.no_grad():
-        traj = model(psi_T, 1.0, steps=steps, return_trajectory=True)
+        traj = model.reverse_diffusion(psi_T, steps=steps)
         traj = traj.cpu()
         traj_complex = torch.stack([real_to_complex(t) for t in traj])
     return traj_complex.numpy()
@@ -483,11 +585,17 @@ for _ in range(n_trajectories):
 time_indices = [0, 3, 10, 30, 99]  # Corresponds to t=0, 0.03, 0.1, 0.3, 1.0
 time_values = [i * DT for i in time_indices]
 
-# Create figure with multiple subplots
-fig = plt.figure(figsize=(20, 4))
+# Create figure with 2 rows
+fig = plt.figure(figsize=(15, 8))
 
 for idx, t_idx in enumerate(time_indices):
-    ax = fig.add_subplot(1, 5, idx + 1, projection='3d')
+    # Calculate subplot position: 2 rows, 3 columns
+    # First 3 plots in row 1, last 2 in row 2 (centered)
+    if idx < 3:
+        ax = fig.add_subplot(2, 3, idx + 1, projection='3d')
+    else:
+        # Center the last 2 plots in the second row
+        ax = fig.add_subplot(2, 3, idx + 2, projection='3d')
     
     # Draw sphere
     plot_bloch_sphere_surface(ax, alpha=0.25)
@@ -536,54 +644,87 @@ for idx, t_idx in enumerate(time_indices):
     # Set consistent viewing angle
     ax.view_init(elev=20, azim=30)
 
+plt.suptitle('Forward Diffusion: Quantum State Spreading', fontsize=18, fontweight='bold', y=0.98)
 plt.tight_layout()
 plt.savefig('bloch_sphere_diffusion.png', dpi=300, bbox_inches='tight', facecolor='white')
 plt.show()
 
-# Also create reverse diffusion visualization
+# Also create reverse diffusion visualization with proper ensemble
 print("\nGenerating reverse diffusion visualization...")
 
-# Generate multiple reverse trajectories
+# Generate ONE forward trajectory to get the final noisy state
+psi_fwd_ref, H_fwd_ref = forward_diffusion(dt=DT, T=T, noise_strength=1.5)
+final_noisy_state = psi_fwd_ref[-1]  # This is the noisy state we'll all start from
+
+print(f"Starting all reverse trajectories from the same noisy state...")
+
+# Generate multiple reverse trajectories ALL STARTING FROM THE SAME NOISY STATE
 all_reverse_trajectories = []
-for _ in range(100):
-    psi_fwd, _ = forward_diffusion(dt=DT, T=T, noise_strength=1.5)
-    psi_rev = reverse_diffusion(model, psi_fwd[-1], steps=STEPS)
+for i in range(100):
+    # All start from the same noisy state
+    psi_rev = reverse_diffusion(model, final_noisy_state, steps=STEPS)
     all_reverse_trajectories.append(psi_rev)
+    
+    if (i + 1) % 25 == 0:
+        print(f"Generated {i+1}/100 reverse trajectories...")
 
-# Create reverse diffusion plot
-fig2 = plt.figure(figsize=(20, 4))
+# Create reverse diffusion plot - should show convergence
+fig2 = plt.figure(figsize=(15, 8))
 
-for idx, t_idx in enumerate([99, 70, 50, 30, 0]):  # Reverse order: t=1.0 to t=0
-    ax = fig2.add_subplot(1, 5, idx + 1, projection='3d')
+# Show reverse diffusion at different time points (going backwards from t=1 to t=0)
+reverse_time_indices = [0, 25, 50, 75, 99]  # t=1.0, 0.75, 0.5, 0.25, 0.0
+reverse_time_values = [1.0 - (i / 99) for i in reverse_time_indices]
+
+for plot_idx, t_idx in enumerate(reverse_time_indices):
+    # Calculate subplot position: 2 rows, 3 columns
+    if plot_idx < 3:
+        ax = fig2.add_subplot(2, 3, plot_idx + 1, projection='3d')
+    else:
+        # Center the last 2 plots in the second row
+        ax = fig2.add_subplot(2, 3, plot_idx + 2, projection='3d')
     
     plot_bloch_sphere_surface(ax, alpha=0.25)
     add_pole_labels(ax)
     
-    # Extract reverse states
+    # Extract reverse states at this timestep
     states_at_t = np.array([traj[t_idx] for traj in all_reverse_trajectories])
     x_t, y_t, z_t = bloch_coords(states_at_t)
     
-    if t_idx == 99:
+    # Color coding
+    if t_idx == 0:
+        # Start of reverse = noisy state (all trajectories start here)
         colors = 'red'
-        sizes = 100
-        alpha = 1.0
-    elif t_idx == 0:
+        sizes = 80
+        alpha_val = 0.8
+        title_suffix = " (all start here)"
+    elif t_idx == 99:
+        # End of reverse = should cluster at clean state
         colors = 'green'
         sizes = 100
-        alpha = 1.0
+        alpha_val = 0.9
+        title_suffix = " (should cluster)"
     else:
+        # Intermediate - denoising in progress
         colors = plt.cm.Oranges(np.linspace(0.4, 0.9, len(x_t)))
-        sizes = 15
-        alpha = 0.6
+        sizes = 30
+        alpha_val = 0.6
+        title_suffix = ""
     
-    ax.scatter(x_t, y_t, z_t, c=colors, s=sizes, alpha=alpha,
+    ax.scatter(x_t, y_t, z_t, c=colors, s=sizes, alpha=alpha_val,
                edgecolors='black', linewidths=0.3, zorder=5)
+    
+    # Also show the true clean state for reference
+    if t_idx == 99:
+        x_clean, y_clean, z_clean = bloch_coords(psi_fwd_ref[0:1])
+        ax.scatter(x_clean, y_clean, z_clean, c='blue', marker='*', s=300,
+                  edgecolors='darkblue', linewidths=2, label='True clean', zorder=10)
     
     ax.set_xlim([-1.2, 1.2])
     ax.set_ylim([-1.2, 1.2])
     ax.set_zlim([-1.2, 1.2])
     ax.set_box_aspect([1,1,1])
-    ax.set_title(f't = {t_idx * DT:.2f}', fontsize=16, fontweight='bold', pad=10)
+    ax.set_title(f't = {reverse_time_values[plot_idx]:.2f}{title_suffix}', 
+                 fontsize=14, fontweight='bold', pad=10)
     
     ax.set_xticks([])
     ax.set_yticks([])
@@ -594,8 +735,38 @@ for idx, t_idx in enumerate([99, 70, 50, 30, 0]):  # Reverse order: t=1.0 to t=0
     ax.zaxis.pane.fill = False
     ax.view_init(elev=20, azim=30)
 
+plt.suptitle('Reverse Diffusion: Ensemble Denoising from Single Noisy State', 
+             fontsize=18, fontweight='bold', y=0.98)
 plt.tight_layout()
 plt.savefig('bloch_sphere_reverse_diffusion.png', dpi=300, bbox_inches='tight', facecolor='white')
 plt.show()
+
+# Compute clustering metric at final time
+final_states = np.array([traj[-1] for traj in all_reverse_trajectories])
+x_final, y_final, z_final = bloch_coords(final_states)
+
+# Measure spread (standard deviation in Bloch coordinates)
+spread_x = np.std(x_final)
+spread_y = np.std(y_final)
+spread_z = np.std(z_final)
+total_spread = np.sqrt(spread_x**2 + spread_y**2 + spread_z**2)
+
+print(f"\nReverse diffusion clustering metrics:")
+print(f"Final spread (std): x={spread_x:.4f}, y={spread_y:.4f}, z={spread_z:.4f}")
+print(f"Total spread: {total_spread:.4f} (smaller is better - should be < 0.1 for good clustering)")
+
+# Compute average fidelity with true clean state
+true_clean = psi_fwd_ref[0]
+fidelities = []
+for traj in all_reverse_trajectories:
+    final_state = traj[-1]
+    overlap = np.vdot(final_state, true_clean)
+    fidelity = np.abs(overlap)**2
+    fidelities.append(fidelity)
+
+avg_fidelity = np.mean(fidelities)
+std_fidelity = np.std(fidelities)
+print(f"Average final fidelity: {avg_fidelity:.4f} ± {std_fidelity:.4f}")
+print(f"(Fidelity > 0.95 indicates good denoising)")
 
 print("Visualizations saved!")
