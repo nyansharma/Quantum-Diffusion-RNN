@@ -116,10 +116,14 @@ def forward_diffusion_with_probability(dt, T, noise_strength=0.5):
 
 def drift_vector(psi, O):
     psi = psi.flatten()
-    O_psi = O@psi
+    theta = np.random.uniform(0, 0.3)
+    phi = np.random.uniform(0, 2*np.pi)
+    O_mixed = np.cos(theta)*O + np.sin(theta)*(np.cos(phi)*X + np.sin(phi)*Y) / np.sqrt(2)
+    
+    O_psi = O_mixed @ psi
     exp_O = np.dot(psi.conj(), O_psi)
-    delta_O = O - exp_O*np.eye(2, dtype=complex)
-    return -0.5*((delta_O@delta_O)@psi)
+    delta_O = O_mixed - exp_O * np.eye(2, dtype=complex)
+    return -0.5 * (delta_O @ delta_O @ psi)
 
 def noise_vector(O, psi):
     avg_O = np.vdot(psi, O @ psi)
@@ -136,40 +140,27 @@ def flow_vector(score, drift):
 def Hamiltonian(flow, psi):
     h = 1j*(np.outer(flow, psi))
     return h + h.conj().T
-def forward_diffusion(dt, T, noise_strength=0.5):
+def forward_diffusion(dt, T, noise_strength=1.0):
     n = int(T / dt)
     psi = np.zeros((n, 2), dtype=np.complex128)
-    psi[0] = psi_0.astype(np.complex128)
+    psi[0] = psi_0.copy()
     H = np.zeros((n, 2, 2), dtype=np.complex128)
     
     for i in range(n - 1):
+        t_frac = i / n
+        O = PAULI[i % 4]
+        dW = (np.random.randn(2) + 1j * np.random.randn(2)) * np.sqrt(dt)
     
-        O = PAULI[np.random.randint(0, 4)]
-        
-        drift = drift_vector(psi[i], O)
-        
-    
-        dW_real = np.random.randn(2) * np.sqrt(dt)
-        dW_imag = np.random.randn(2) * np.sqrt(dt)
-        dW = dW_real + 1j * dW_imag
-        
-       
-        noise = noise_vector(O, psi[i])
-        
-        current_noise_strength = noise_strength * (i / n)
-        
-    
-        delta_psi = drift * dt + current_noise_strength * noise * np.linalg.norm(dW)
-        
+        overlap = np.dot(psi[i].conj(), dW)
+        dW_tangent = dW - overlap * psi[i]
+        tangent_drift = O @ psi[i] - np.dot(psi[i].conj(), O @ psi[i]) * psi[i]
+        delta_psi = 0.1 * tangent_drift * dt + noise_strength * dW_tangent
         psi[i+1] = psi[i] + delta_psi
+        psi[i+1] /= np.linalg.norm(psi[i+1])
         
-        psi[i+1] = psi[i+1] / np.linalg.norm(psi[i+1])
-        
-        flow = drift  
-        H[i] = Hamiltonian(flow, psi[i])
+        H[i] = Hamiltonian(tangent_drift, psi[i])
     
     return psi, H
-
 class HamiltonianDenoisingNetwork(nn.Module):
     def __init__(self, hidden_dim=256):
         super().__init__()
@@ -281,30 +272,24 @@ class HamiltonianDenoisingNetwork(nn.Module):
         return psi_evolved
     
     def denoise_step_with_hamiltonian(self, psi_noisy, t, dt=0.01, use_hamiltonian=True):
-       
         H_pred, flow_pred, noise_pred, clean_pred = self.forward(psi_noisy, t)
-        
+    
         if torch.is_complex(psi_noisy):
             psi_real = complex_to_real(psi_noisy.to(torch.complex64))
         else:
             psi_real = psi_noisy
-        
-        
-        if use_hamiltonian and t > 0.3:  
-            psi_complex = real_to_complex(psi_real)
-            psi_evolved = self.hamiltonian_evolution(psi_complex, H_pred, -dt)  
-            denoised = complex_to_real(psi_evolved)
-        
-        elif t > 0.1:
-            alpha = 1 - t
-            denoised = psi_real + flow_pred * dt - (1 - alpha) * noise_pred * dt
-        
     
+        t_val = t.item() if hasattr(t, 'item') else float(t)
+    
+        if use_hamiltonian and t_val > 0.1:
+            psi_complex = real_to_complex(psi_real)
+            psi_evolved = self.hamiltonian_evolution(psi_complex, H_pred, -dt)
+  
+            denoised = complex_to_real(psi_evolved) + flow_pred * dt * t_val
         else:
-            
-            denoised = 0.7 * clean_pred + 0.3 * psi_real
-        
-        
+      
+            denoised = psi_real + flow_pred * dt
+    
         denoised_complex = real_to_complex(denoised)
         return complex_to_real(denoised_complex)
     
@@ -335,42 +320,45 @@ class HamiltonianDenoisingLoss(nn.Module):
         super().__init__()
     
     def forward(self, H_pred, flow_pred, noise_pred, clean_pred, 
-                true_noise, true_clean, psi_current, H_true=None):
-
+            true_noise, true_clean, psi_noisy, H_true=None):
+    
         true_clean = true_clean.to(torch.complex64)
         true_clean_real = complex_to_real(true_clean)
-        
     
+ 
         clean_pred_complex = real_to_complex(clean_pred)
         overlap = torch.sum(clean_pred_complex.conj() * true_clean)
-        fidelity = torch.abs(overlap) ** 2
-        clean_loss = 1 - fidelity
-        
-        if true_noise is not None:
-            noise_loss = torch.mean((noise_pred - true_noise) ** 2)
-        else:
-            noise_loss = 0.0
-       
+        clean_loss = 1 - torch.abs(overlap) ** 2
+    
+    
+        noise_loss = torch.mean((noise_pred - true_noise) ** 2) if true_noise is not None else 0.0
+    
+   
         H_herm_error = torch.sum(torch.abs(H_pred - H_pred.conj().T) ** 2)
-        
-        
         psi_complex = real_to_complex(true_clean_real)
         energy = torch.real(psi_complex.conj() @ H_pred @ psi_complex)
-        energy_penalty = torch.relu(torch.abs(energy) - 10.0)  
-        
-        hamiltonian_loss = H_herm_error + 0.1 * energy_penalty
+        hamiltonian_loss = H_herm_error + 0.1 * torch.relu(torch.abs(energy) - 10.0)
+    
+    
+        if torch.is_complex(psi_noisy):
+            psi_noisy_real = complex_to_real(psi_noisy.to(torch.complex64))
+        else:
+            psi_noisy_real = psi_noisy
+    
+        true_flow_direction = true_clean_real - psi_noisy_real
+        true_flow_norm = torch.norm(true_flow_direction) + 1e-8
 
-        denoising_direction = true_clean_real - complex_to_real(real_to_complex(true_clean_real))
-        flow_alignment = -torch.sum(flow_pred * denoising_direction)  
-        
-        
+        true_flow_unit = true_flow_direction / true_flow_norm
+
+
+        flow_loss = torch.mean((flow_pred - true_flow_unit) ** 2)
+    
         total_loss = (
-            0.5 * clean_loss +           
-            0.2 * noise_loss +            
-            0.1 * hamiltonian_loss +      
-            0.05 * flow_alignment         
+            0.5 * clean_loss +
+            0.2 * noise_loss +
+            0.1 * hamiltonian_loss +
+            0.05 * flow_loss        
         )
-        
         return total_loss
 
 model = HamiltonianDenoisingNetwork(hidden_dim=256)
@@ -406,8 +394,8 @@ def train_step(model, optimizer, psi_trajectory, H_trajectory, criterion):
     H_pred, flow_pred, noise_pred, clean_pred = model(psi_noisy, t_tensor)
     
   
-    loss = criterion(H_pred, flow_pred, noise_pred, clean_pred, 
-                    true_noise, psi_clean, psi_noisy_real, H_true)
+    loss = criterion(H_pred, flow_pred, noise_pred, clean_pred,
+                 true_noise, psi_clean, psi_noisy_real, H_true)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
