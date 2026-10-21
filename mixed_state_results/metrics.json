@@ -1,0 +1,59 @@
+{
+  "arguments": {
+    "ensemble": "ball",
+    "radius": 0.6,
+    "radius_min": 0.0,
+    "radius_max": 0.9,
+    "steps": 200,
+    "epochs": 100,
+    "train_trajectories": 256,
+    "validation_trajectories": 64,
+    "test_trajectories": 64,
+    "batch_size": 32,
+    "hidden_dim": 64,
+    "gamma": 1.0,
+    "total_time": 1.0,
+    "lr": 0.002,
+    "seed": 67,
+    "threads": 2,
+    "rollout_every": 5,
+    "device": "cpu",
+    "animate": true,
+    "visualize_only": null,
+    "viz_trajectories": 128,
+    "gif_fps": 20,
+    "gif_frames": 120,
+    "gif_dpi": 100,
+    "snapshot_fractions": [
+      0,
+      0.25,
+      0.5,
+      0.75,
+      1
+    ],
+    "out": "mixed_state_results"
+  },
+  "before_training": {
+    "mean_path_fidelity": 0.7451261773599817,
+    "min_point_fidelity": 0.056787630356519854,
+    "initial_state_fidelity": 0.5340116458515767,
+    "mean_path_state_loss": 0.22731862736823572,
+    "mean_path_purity_error": 0.07387050084033696,
+    "mean_gain": 0.0,
+    "mean_gain_error": 1.0
+  },
+  "after_training": {
+    "mean_path_fidelity": 0.9998605254096029,
+    "min_point_fidelity": 0.9880364540039162,
+    "initial_state_fidelity": 0.9992658943427696,
+    "mean_path_state_loss": 0.0001326332153279277,
+    "mean_path_purity_error": 0.001259013394988237,
+    "mean_gain": 0.9952739153049524,
+    "mean_gain_error": 0.0047481789337917805
+  },
+  "best_epoch": 100,
+  "task": "record-conditioned mixed-state reconstruction",
+  "dtype": "float64",
+  "exact_inverse_max_matrix_error": 3.150919556060196e-14,
+  "reverse_min_eigenvalue": 0.00142796856132954
+}
